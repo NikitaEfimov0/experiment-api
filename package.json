@@ -1,0 +1,23 @@
+{
+  "name": "experiment-api",
+  "version": "1.0.0",
+  "description": "REST API + admin UI for the Parkinson's Disease experiment study",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test/smoke.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "pg": "^8.12.0"
+  },
+  "devDependencies": {
+    "pg-mem": "^2.8.1"
+  }
+}

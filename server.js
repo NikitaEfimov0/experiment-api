@@ -15,6 +15,11 @@ async function main() {
     console.log(`  Admin UI: http://localhost:${PORT}/admin`);
     console.log(`  Docs:     http://localhost:${PORT}/docs`);
     console.log(`  Spec:     http://localhost:${PORT}/openapi.yaml`);
+    console.log(
+      process.env.PI_AGENT_URL
+        ? `  Recording: Raspberry Pi agent at ${process.env.PI_AGENT_URL}`
+        : '  Recording: STUB mode (set PI_AGENT_URL to use the Pi agent)'
+    );
   });
 }
 

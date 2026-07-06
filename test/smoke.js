@@ -154,7 +154,143 @@ async function main() {
   ok('GET /admin serves UI');
 
   server.close();
+
+  // =========================================================================
+  // Pi-agent mode: fake Raspberry Pi agent per INTEGRATION.md
+  // =========================================================================
+  console.log('\nPi-agent mode:');
+  const fs = require('fs');
+  const os = require('os');
+  const path = require('path');
+  const express = require('express');
+
+  const TOKEN = 'test-token-123';
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'exp-raw-'));
+
+  const mem2 = newDb();
+  const { Pool: Pool2 } = mem2.adapters.createPg();
+  const pool2 = new Pool2();
+  await db.initSchema(pool2);
+
+  // Fake Pi agent -----------------------------------------------------------
+  let piState = { state: 'idle', exerciseId: null, startedAt: null, endedAt: null };
+  let serverBaseUrl = null; // set once the API server is listening
+  const fakePi = express();
+  fakePi.use(express.json());
+  fakePi.get('/status', (_req, res) => res.json({ ...piState, mock: true }));
+  fakePi.post('/recording/start', (req, res) => {
+    if (piState.state === 'recording') return res.status(409).json({ error: 'already recording' });
+    if (!req.body.exerciseId) return res.status(400).json({ error: 'missing exerciseId' });
+    piState = { state: 'recording', exerciseId: req.body.exerciseId, startedAt: new Date().toISOString(), endedAt: null };
+    res.json({ ...piState, mock: true });
+  });
+  fakePi.post('/recording/stop', async (_req, res) => {
+    if (piState.state !== 'recording') return res.status(409).json({ error: 'not recording' });
+    piState.state = 'idle';
+    piState.endedAt = new Date().toISOString();
+    // Upload raw files to the server BEFORE responding (like the real agent).
+    const fd = new FormData();
+    fd.append('exerciseId', piState.exerciseId);
+    fd.append('startedAt', piState.startedAt);
+    fd.append('endedAt', piState.endedAt);
+    fd.append('metadata', JSON.stringify({ results: { video: { ok: true }, audio: { ok: true }, accelerometer: { ok: true } }, mock: true }));
+    fd.append('video', new Blob([Buffer.from('fake-mp4')], { type: 'video/mp4' }), 'video.mp4');
+    fd.append('audio', new Blob([Buffer.from('fake-wav')], { type: 'audio/wav' }), 'audio.wav');
+    const csv = 't_s,ax_g,ay_g,az_g,gx_dps,gy_dps,gz_dps,temp_c\n' +
+      Array.from({ length: 250 }, (_, i) => `${(i / 100).toFixed(2)},0,0,1,0,0,0,25`).join('\n');
+    fd.append('accelerometer', new Blob([csv], { type: 'text/csv' }), 'mpu6050.csv');
+    const up = await fetch(`${serverBaseUrl}/exercises/${piState.exerciseId}/data/raw`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${TOKEN}` },
+      body: fd,
+    });
+    res.json({
+      exerciseId: piState.exerciseId,
+      startedAt: piState.startedAt,
+      endedAt: piState.endedAt,
+      files: { video: { name: 'video.mp4', bytes: 8 }, audio: { name: 'audio.wav', bytes: 8 }, accelerometer: { name: 'mpu6050.csv', bytes: csv.length } },
+      sensors: { video: { ok: true }, audio: { ok: true }, accelerometer: { ok: true } },
+      upload: { ok: up.ok, status: up.status },
+      mock: true,
+    });
+  });
+  const piServer = await new Promise((resolve) => { const s = fakePi.listen(0, () => resolve(s)); });
+  const piUrl = `http://127.0.0.1:${piServer.address().port}`;
+
+  // API server in Pi mode ----------------------------------------------------
+  const app2 = buildApp(pool2, { piAgentUrl: piUrl, ingestToken: TOKEN, dataDir });
+  const server2 = await new Promise((resolve) => { const s = app2.listen(0, () => resolve(s)); });
+  serverBaseUrl = `http://127.0.0.1:${server2.address().port}`;
+
+  const call2 = async (method, path, body, expectStatus, extraHeaders) => {
+    const res = await fetch(serverBaseUrl + path, {
+      method,
+      headers: { ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}), ...(extraHeaders || {}) },
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    });
+    assert.strictEqual(res.status, expectStatus, `${method} ${path} -> ${res.status}, expected ${expectStatus}`);
+    if (res.status === 204) return null;
+    return res.json().catch(() => null);
+  };
+
+  const agentStatus = await call2('GET', '/agent/status', undefined, 200);
+  assert.strictEqual(agentStatus.mode, 'pi');
+  assert.strictEqual(agentStatus.reachable, true);
+  ok('GET /agent/status reports Pi reachable');
+
+  const pexp = await call2('POST', '/experiments', { patientNumber: 'P-0100' }, 201);
+  const pex = await call2('POST', `/experiments/${pexp.id}/exercises`, {}, 201);
+
+  const pstart = await call2('POST', `/exercises/${pex.id}/recording/start`, undefined, 200);
+  assert.strictEqual(pstart.recordingStatus, 'recording');
+  assert.strictEqual(piState.exerciseId, pex.id, 'Pi received the exerciseId');
+  ok('start delegates to Pi agent');
+
+  const pstop = await call2('POST', `/exercises/${pex.id}/recording/stop`, undefined, 200);
+  assert.strictEqual(pstop.recordingStatus, 'stopped');
+  assert.strictEqual(pstop.hasData, true, 'raw upload landed during stop');
+  assert.strictEqual(pstop.hasRawData, true);
+  ok('stop triggers Pi upload; data stored');
+
+  const pdata = await call2('GET', `/exercises/${pex.id}/data`, undefined, 200);
+  assert.strictEqual(pdata.exerciseId, pex.id);
+  assert.strictEqual(pdata.startedAt, piState.startedAt, "Pi's startedAt is authoritative");
+  assert.strictEqual(pdata.footSpeed.values.length, 250, 'footSpeed sized from real CSV rows');
+  ok('processed ExerciseData derived from raw upload');
+
+  const manifest = await call2('GET', `/exercises/${pex.id}/data/raw`, undefined, 200);
+  assert.ok(manifest.files.video && manifest.files.audio && manifest.files.accelerometer);
+  assert.strictEqual(manifest.metadata.mock, true);
+  ok('GET raw manifest');
+
+  const fileRes = await fetch(`${serverBaseUrl}/exercises/${pex.id}/data/raw/accelerometer`);
+  assert.strictEqual(fileRes.status, 200);
+  const csvBody = await fileRes.text();
+  assert.ok(csvBody.startsWith('t_s,ax_g'));
+  ok('download raw file');
+
+  // Auth: upload without token is rejected.
+  const badUp = await fetch(`${serverBaseUrl}/exercises/${pex.id}/data/raw`, { method: 'POST', body: new FormData() });
+  assert.strictEqual(badUp.status, 401);
+  ok('raw upload without bearer token -> 401');
+
+  // Clear removes data, raw manifest and files on disk.
+  await call2('DELETE', `/exercises/${pex.id}/data`, undefined, 204);
+  const cleared2 = await call2('GET', `/exercises/${pex.id}`, undefined, 200);
+  assert.strictEqual(cleared2.hasData, false);
+  assert.strictEqual(cleared2.hasRawData, false);
+  assert.ok(!fs.existsSync(path.join(dataDir, pex.id)), 'raw files removed from disk');
+  ok('clear data removes raw files');
+
+  // Pi unreachable -> 502 from start.
+  piServer.close();
+  await call2('POST', `/exercises/${pex.id}/recording/start`, undefined, 502);
+  ok('Pi unreachable -> 502');
+
+  server2.close();
   await pool.end?.();
+  await pool2.end?.();
+  fs.rmSync(dataDir, { recursive: true, force: true });
   console.log(`\nAll ${passed} checks passed.`);
 }
 

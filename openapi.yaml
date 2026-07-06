@@ -256,6 +256,75 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
 
+  /exercises/{exerciseId}/data/raw:
+    parameters:
+      - $ref: '#/components/parameters/ExerciseId'
+    post:
+      tags: [Data]
+      summary: Ingest raw recording files from the recording agent
+      description: >
+        Called by the Raspberry Pi recording agent after a recording stops.
+        One multipart/form-data request with text fields `exerciseId`,
+        `startedAt`, `endedAt`, `metadata` (JSON string) and file parts
+        `video` (video/mp4), `audio` (audio/wav), `accelerometer` (text/csv).
+        If the server is configured with an ingest token, requires
+        `Authorization: Bearer <token>`. The server stores the files, runs
+        signal processing and stores the resulting ExerciseData.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                exerciseId: { type: string }
+                startedAt: { type: string, format: date-time }
+                endedAt: { type: string, format: date-time }
+                metadata: { type: string, description: 'JSON: {"results":{...},"mock":false}' }
+                video: { type: string, format: binary }
+                audio: { type: string, format: binary }
+                accelerometer: { type: string, format: binary }
+      responses:
+        '201':
+          description: Raw data stored and processed.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          description: Invalid or missing bearer token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    get:
+      tags: [Data]
+      summary: Get the raw-file manifest for an exercise
+      responses:
+        '200':
+          description: Manifest of stored raw files (names, sizes, sensor results).
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /exercises/{exerciseId}/data/raw/{part}:
+    parameters:
+      - $ref: '#/components/parameters/ExerciseId'
+      - name: part
+        in: path
+        required: true
+        description: Which raw file to download.
+        schema:
+          type: string
+          enum: [video, audio, accelerometer]
+    get:
+      tags: [Data]
+      summary: Download one raw recording file
+      responses:
+        '200':
+          description: The raw file (video/mp4, audio/wav or text/csv).
+        '404':
+          $ref: '#/components/responses/NotFound'
+
 components:
   parameters:
     ExperimentId:

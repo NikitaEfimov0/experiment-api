@@ -82,6 +82,7 @@
     <a href="#/exercises" id="nav-exercises">Exercises</a>
   </nav>
   <div class="spacer"></div>
+  <span id="agent-pill" class="badge idle" title="Recording agent status" style="margin-right:14px">agent: …</span>
   <a class="doclink" href="/docs" target="_blank">API docs ↗</a>
 </header>
 <main id="view"></main>
@@ -423,13 +424,19 @@ async function viewExerciseDetail(id) {
     controls.appendChild(b);
     controls.appendChild(document.createTextNode(' '));
   };
-  const act = (fn) => async () => {
-    try { await fn(); route(); } catch (err) { toast(err.message, true); }
+  const act = (fn, busyLabel) => async (e) => {
+    const b = e.currentTarget;
+    const original = b.textContent;
+    b.disabled = true;
+    if (busyLabel) b.textContent = busyLabel;
+    try { await fn(); route(); }
+    catch (err) { toast(err.message, true); b.disabled = false; b.textContent = original; }
   };
   if (ex.recordingStatus === 'recording') {
-    btn('■ Stop recording', 'warn', act(async () => { await api('POST', `/exercises/${id}/recording/stop`); toast('Recording stopped — data captured'); }));
+    btn('■ Stop recording', 'warn', act(async () => { await api('POST', `/exercises/${id}/recording/stop`); toast('Recording stopped'); }, 'Stopping… (finalising & uploading)'));
   } else {
-    btn('● Start recording', 'ok', act(async () => { await api('POST', `/exercises/${id}/recording/start`); toast('Recording started'); }), ex.hasData);
+    // Camera warm-up on the Pi can take up to ~18s before start returns.
+    btn('● Start recording', 'ok', act(async () => { await api('POST', `/exercises/${id}/recording/start`); toast('Recording started'); }, 'Starting… (camera warm-up)'), ex.hasData);
   }
   if (ex.hasData) {
     btn('Clear data', 'danger', act(async () => {
@@ -446,19 +453,48 @@ async function viewExerciseDetail(id) {
 
   const section = document.getElementById('data-section');
   if (!ex.hasData) {
-    section.innerHTML = `<div class="card"><div class="empty">${
-      ex.recordingStatus === 'recording'
-        ? 'Recording in progress… stop the recording to capture data.'
-        : 'No recorded data yet. Start a recording to capture sensor data.'
-    }</div></div>`;
+    let msg = 'No recorded data yet. Start a recording to capture sensor data.';
+    if (ex.recordingStatus === 'recording') msg = 'Recording in progress… stop the recording to capture data.';
+    else if (ex.recordingStatus === 'stopped') msg = 'Recording stopped — waiting for the recording agent to upload data. Reload in a moment, or clear to re-record.';
+    section.innerHTML = `<div class="card"><div class="empty">${msg}</div></div>`;
     return;
   }
   const data = await api('GET', `/exercises/${id}/data`);
-  renderData(section, data);
+  let raw = null;
+  if (ex.hasRawData) {
+    raw = await api('GET', `/exercises/${id}/data/raw`).catch(() => null);
+  }
+  renderData(section, data, raw, id);
 }
 
-function renderData(section, data) {
+function rawFilesCard(raw, exerciseId) {
+  if (!raw || !raw.files) return '';
+  const sensors = (raw.metadata && raw.metadata.results) || {};
+  const fmtBytes = (b) => b > 1048576 ? (b / 1048576).toFixed(1) + ' MB' : b > 1024 ? (b / 1024).toFixed(1) + ' KB' : b + ' B';
+  const rows = Object.entries(raw.files).map(([part, f]) => {
+    const s = sensors[part];
+    const okBadge = s ? (s.ok ? '<span class="badge data">ok</span>' : '<span class="badge recording">failed</span>') : '';
+    return `<tr>
+      <td><b>${esc(part)}</b></td>
+      <td class="mono">${esc(f.name)}</td>
+      <td>${fmtBytes(f.bytes || 0)}</td>
+      <td>${okBadge}</td>
+      <td><a class="btn small" href="/exercises/${esc(exerciseId)}/data/raw/${esc(part)}">Download</a></td>
+    </tr>`;
+  }).join('');
+  return `
+    <div class="card">
+      <h2>Raw files <span class="muted" style="font-weight:normal;font-size:12px">from recording agent, received ${fmtDate(raw.receivedAt)}${raw.metadata && raw.metadata.mock ? ' · <b>mock mode</b>' : ''}</span></h2>
+      <table>
+        <thead><tr><th>Sensor</th><th>File</th><th>Size</th><th>Status</th><th></th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>`;
+}
+
+function renderData(section, data, raw, exerciseId) {
   section.innerHTML = `
+    ${rawFilesCard(raw, exerciseId)}
     <div class="card">
       <h2>Recorded data</h2>
       <p class="muted" style="font-size:13px">
@@ -549,6 +585,19 @@ async function route() {
 }
 window.addEventListener('hashchange', route);
 route();
+
+// Recording-agent status pill in the header (refreshes every 15s).
+async function refreshAgentPill() {
+  const pill = document.getElementById('agent-pill');
+  try {
+    const s = await api('GET', '/agent/status');
+    if (!s.configured) { pill.className = 'badge idle'; pill.textContent = 'agent: stub mode'; }
+    else if (!s.reachable) { pill.className = 'badge recording'; pill.textContent = 'agent: unreachable'; }
+    else { pill.className = 'badge data'; pill.textContent = `agent: ${s.agent.state}${s.agent.mock ? ' (mock)' : ''}`; }
+  } catch { pill.className = 'badge idle'; pill.textContent = 'agent: ?'; }
+}
+refreshAgentPill();
+setInterval(refreshAgentPill, 15000);
 </script>
 </body>
 </html>

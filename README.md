@@ -34,11 +34,45 @@ Then open:
 
 Environment variables:
 
-| Variable       | Description                                                        |
-| -------------- | ------------------------------------------------------------------ |
-| `DATABASE_URL` | PostgreSQL connection string (**required**)                        |
-| `PORT`         | HTTP port (default `3000`)                                         |
-| `PGSSL`        | Set to `require` to enable SSL (needed for public DB endpoints)    |
+| Variable              | Description                                                                 |
+| --------------------- | --------------------------------------------------------------------------- |
+| `DATABASE_URL`        | PostgreSQL connection string (**required**)                                 |
+| `PORT`                | HTTP port (default `3000`)                                                  |
+| `PGSSL`               | Set to `require` to enable SSL (needed for public DB endpoints)             |
+| `PI_AGENT_URL`        | Raspberry Pi recording agent, e.g. `http://raspberrypi.local:8090`. Unset = stub mode |
+| `PI_START_TIMEOUT_MS` | Timeout for Pi `recording/start` (default `20000` — camera warm-up)         |
+| `PI_STOP_TIMEOUT_MS`  | Timeout for Pi `recording/stop` incl. its upload (default `60000`)          |
+| `INGEST_TOKEN`        | If set, the raw-ingestion route requires `Authorization: Bearer <token>` (set the same value as `SERVER_TOKEN` on the Pi) |
+| `DATA_DIR`            | Where raw uploaded files are stored (default `./data`; on Railway attach a Volume and point this at its mount path) |
+
+## Raspberry Pi recording agent integration
+
+With `PI_AGENT_URL` set, the recording lifecycle is delegated to the Pi agent
+(see `INTEGRATION.md` contract):
+
+1. `POST /exercises/{id}/recording/start` → server calls Pi `POST /recording/start
+   {exerciseId}` and waits for the camera warm-up (~1–4 s, worst case ~18 s).
+   The Pi's `startedAt` is stored as authoritative.
+2. `POST /exercises/{id}/recording/stop` → server calls Pi `POST /recording/stop`.
+   Before responding, the Pi uploads its raw files to
+   **`POST /exercises/{exerciseId}/data/raw`** (multipart: `exerciseId`,
+   `startedAt`, `endedAt`, `metadata` + files `video`, `audio`, `accelerometer`).
+   The server stores the files under `DATA_DIR/{exerciseId}/`, runs signal
+   processing (`src/processing.js`) and stores the resulting `ExerciseData`.
+3. Raw files stay downloadable via `GET /exercises/{id}/data/raw` (manifest) and
+   `GET /exercises/{id}/data/raw/{video|audio|accelerometer}`.
+
+Pi-side configuration: `SERVER_BASE_URL` = this server's URL, `SERVER_TOKEN` =
+value of `INGEST_TOKEN`, `UPLOAD_PATH_TEMPLATE` = `/exercises/{exerciseId}/data/raw`
+(the default — matches this server).
+
+Without `PI_AGENT_URL` the server behaves as before: stub data is generated on
+stop (useful for development without hardware).
+
+**Signal processing status:** `src/processing.js` currently contains
+spec-shaped placeholders. The MediaPipe mouth-opening pipeline exists (on a
+Mac) and should be ported into `processVideo()`; sound-pressure and gait
+processors are not built yet by anyone. Each processor is an isolated function.
 
 ## Deploy on Railway
 

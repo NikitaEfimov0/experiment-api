@@ -116,6 +116,22 @@ railway up            # uploads and deploys the current folder
 railway domain        # generate a public URL
 ```
 
+### Raspberry Pi agent on Railway
+
+If the server runs on Railway and controls a Pi in the lab:
+
+- The **server must be able to reach the Pi** (`PI_AGENT_URL`). A Pi on a lab
+  LAN is not reachable from Railway directly — expose it via a tunnel
+  (e.g. Tailscale/WireGuard) or run the server on a machine on the same
+  network as the Pi. This is the main deployment decision to make with the
+  hardware team.
+- On the Pi set `SERVER_BASE_URL=https://<your-app>.up.railway.app` (never
+  `localhost` — on the Pi that points at the Pi itself), and
+  `SERVER_TOKEN` = the same value as the server's `INGEST_TOKEN`.
+- Add a **Volume** to the app service (right-click service → Attach Volume),
+  mount it e.g. at `/data`, and set `DATA_DIR=/data` — otherwise uploaded raw
+  files are lost on every redeploy (container disk is ephemeral).
+
 ### Troubleshooting
 
 - **App crashes with "DATABASE_URL is not set"** — step 4 was skipped, or the

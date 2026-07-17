@@ -217,8 +217,24 @@ async function main() {
   const piServer = await new Promise((resolve) => { const s = fakePi.listen(0, () => resolve(s)); });
   const piUrl = `http://127.0.0.1:${piServer.address().port}`;
 
+  // Fake "python" binary standing in for the feature pipeline ----------------
+  const fakePipelineOut = {
+    features: {
+      step_count: 28, cadence: 110.8, gait_regularity: 0.147, activity_ratio: 0.757,
+      mean_rotation: 130.2, rotation_variability: 97.7,
+      mean_loudness: 0.017, vocal_activity_ratio: 0.597, loudness_variability: 0.02, loudness_trend: -0.0015,
+      mean_mouth_opening: 1.21, mouth_opening_rate: 67.3, opening_variability: 2.45, opening_trend: -0.03,
+      video_detection_rate: 1.0,
+    },
+    mouthOpening: { values: Array.from({ length: 10 }, (_, i) => [1 + i * 0.1, 50 + i]), sampleRate: 30 },
+    soundPressure: { values: Array.from({ length: 20 }, (_, i) => -40 + i), sampleRate: 62.5, unit: 'dB' },
+  };
+  const fakePython = path.join(dataDir, 'fake-python.sh');
+  fs.writeFileSync(fakePython, `#!/bin/sh\ncat "${path.join(dataDir, 'pipeline-out.json')}"\n`, { mode: 0o755 });
+  fs.writeFileSync(path.join(dataDir, 'pipeline-out.json'), JSON.stringify(fakePipelineOut));
+
   // API server in Pi mode ----------------------------------------------------
-  const app2 = buildApp(pool2, { piAgentUrl: piUrl, ingestToken: TOKEN, dataDir });
+  const app2 = buildApp(pool2, { piAgentUrl: piUrl, ingestToken: TOKEN, dataDir, pythonBin: fakePython });
   const server2 = await new Promise((resolve) => { const s = app2.listen(0, () => resolve(s)); });
   serverBaseUrl = `http://127.0.0.1:${server2.address().port}`;
 
@@ -258,6 +274,35 @@ async function main() {
   assert.strictEqual(pdata.footSpeed.values.length, 250, 'footSpeed sized from real CSV rows');
   ok('processed ExerciseData derived from raw upload');
 
+  // Background pipeline: poll until the real features land in the data.
+  let piped = null;
+  for (let i = 0; i < 50; i++) {
+    const d = await call2('GET', `/exercises/${pex.id}/data`, undefined, 200);
+    if (d.features) { piped = d; break; }
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  assert.ok(piped, 'pipeline results were merged into ExerciseData');
+  assert.strictEqual(piped.features.step_count, 28);
+  assert.strictEqual(piped.mouthOpening.values.length, 10);
+  assert.deepStrictEqual(piped.mouthOpening.values[0], [1, 50]);
+  assert.strictEqual(piped.processedSignals.mouthOpening, true);
+  assert.strictEqual(piped.processedSignals.footSpeed, false);
+  assert.strictEqual(piped.aggregates.averages.soundPressure, -30.5);
+  assert.strictEqual(piped.soundPressure.sampleRate, 62.5);
+  assert.strictEqual(piped.pipeline.status, 'done');
+  ok('feature pipeline merges real mouth/sound signals + features');
+
+  // Reprocess on demand (for recordings made before the pipeline existed).
+  await call2('POST', `/exercises/${pex.id}/data/reprocess`, undefined, 202);
+  let reprocessed = null;
+  for (let i = 0; i < 50; i++) {
+    const d = await call2('GET', `/exercises/${pex.id}/data`, undefined, 200);
+    if (d.pipeline && d.pipeline.status === 'done') { reprocessed = d; break; }
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  assert.ok(reprocessed && reprocessed.features, 'reprocess reran the pipeline');
+  ok('POST data/reprocess reruns pipeline');
+
   const manifest = await call2('GET', `/exercises/${pex.id}/data/raw`, undefined, 200);
   assert.ok(manifest.files.video && manifest.files.audio && manifest.files.accelerometer);
   assert.strictEqual(manifest.metadata.mock, true);
@@ -281,6 +326,9 @@ async function main() {
   assert.strictEqual(cleared2.hasRawData, false);
   assert.ok(!fs.existsSync(path.join(dataDir, pex.id)), 'raw files removed from disk');
   ok('clear data removes raw files');
+
+  await call2('POST', `/exercises/${pex.id}/data/reprocess`, undefined, 409);
+  ok('reprocess without raw files -> 409');
 
   // Pi unreachable -> 502 from start.
   piServer.close();

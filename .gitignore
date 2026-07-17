@@ -1,3 +1,6 @@
 node_modules/
 .env
-
+data/
+pipeline/.venv/
+pipeline/outputs/
+__pycache__/

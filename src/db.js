@@ -266,6 +266,15 @@ async function getRawManifest(pool, id) {
   return { found: true, raw: rows[0].raw };
 }
 
+/** Replace the processed ExerciseData payload (used by the pipeline runner). */
+async function updateExerciseData(pool, id, data) {
+  const { rowCount } = await pool.query(
+    'UPDATE exercises SET data = $2 WHERE id = $1 AND data IS NOT NULL',
+    [id, JSON.stringify(data)]
+  );
+  return rowCount > 0;
+}
+
 async function getExerciseData(pool, id) {
   const { rows } = await pool.query('SELECT data FROM exercises WHERE id = $1', [id]);
   if (!rows[0]) return { found: false, data: null };
@@ -302,6 +311,7 @@ module.exports = {
   markStopped,
   saveRawRecording,
   getRawManifest,
+  updateExerciseData,
   getExerciseData,
   clearExerciseData,
 };

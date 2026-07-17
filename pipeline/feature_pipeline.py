@@ -42,6 +42,8 @@ ROTATE_FLAG = cv2.ROTATE_90_COUNTERCLOCKWISE
 # MediaPipe FaceMesh landmark indices
 LM_UPPER_LIP = 13
 LM_LOWER_LIP = 14
+LM_MOUTH_CORNER_RIGHT = 61   # inner mouth corners, for horizontal opening
+LM_MOUTH_CORNER_LEFT = 291
 LM_IRIS_RIGHT = 468   # requires refine_landmarks=True
 LM_IRIS_LEFT = 473
 LM_EYE_OUTER_RIGHT = 33   # fallback if iris landmarks unavailable
@@ -138,6 +140,86 @@ def voice_features(wav_path: str | Path) -> dict:
 # Part 4 — Video features (rotation-corrected MediaPipe FaceMesh)
 # ---------------------------------------------------------------------------
 
+# Model for the modern MediaPipe Tasks API (used when the legacy Solutions
+# API was removed from the installed mediapipe version). Downloaded once.
+FACE_MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
+    "face_landmarker/float16/latest/face_landmarker.task"
+)
+FACE_MODEL_PATH = Path(__file__).parent / "models" / "face_landmarker.task"
+
+
+def _ensure_face_model() -> Path:
+    if not FACE_MODEL_PATH.exists():
+        import sys
+        import urllib.request
+
+        FACE_MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = FACE_MODEL_PATH.with_suffix(".task.part")
+        print(f"Downloading face landmark model to {FACE_MODEL_PATH} ...",
+              file=sys.stderr, flush=True)
+        try:
+            urllib.request.urlretrieve(FACE_MODEL_URL, tmp)
+            tmp.rename(FACE_MODEL_PATH)  # atomic: no corrupt half-downloads
+        except Exception as exc:
+            tmp.unlink(missing_ok=True)
+            raise RuntimeError(
+                f"Could not download the face landmark model ({exc}). "
+                f"Download it manually from {FACE_MODEL_URL} and save it as "
+                f"{FACE_MODEL_PATH}"
+            ) from exc
+    return FACE_MODEL_PATH
+
+
+def _make_face_landmarker():
+    """Return (detect, close) working on any installed mediapipe version.
+
+    detect(rgb_frame, timestamp_ms) -> indexable landmarks (with .x/.y) or None.
+    Prefers the legacy Solutions FaceMesh; newer mediapipe releases removed it,
+    in which case the Tasks-API FaceLandmarker is used (same 478 landmarks,
+    including iris 468/473, so all landmark indices stay valid).
+    """
+    import mediapipe as mp
+
+    if hasattr(mp, "solutions"):
+        fm = mp.solutions.face_mesh.FaceMesh(
+            static_image_mode=False,
+            max_num_faces=1,
+            refine_landmarks=True,          # enables iris landmarks (468/473)
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
+
+        def detect(rgb, _ts_ms):
+            res = fm.process(rgb)
+            if not res.multi_face_landmarks:
+                return None
+            return res.multi_face_landmarks[0].landmark
+
+        return detect, fm.close
+
+    from mediapipe.tasks import python as mp_tasks
+    from mediapipe.tasks.python import vision
+
+    landmarker = vision.FaceLandmarker.create_from_options(
+        vision.FaceLandmarkerOptions(
+            base_options=mp_tasks.BaseOptions(
+                model_asset_path=str(_ensure_face_model())
+            ),
+            running_mode=vision.RunningMode.VIDEO,
+            num_faces=1,
+        )
+    )
+
+    def detect(rgb, ts_ms):
+        image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        res = landmarker.detect_for_video(image, ts_ms)
+        if not res.face_landmarks:
+            return None
+        return res.face_landmarks[0]
+
+    return detect, landmarker.close
+
 def extract_mouth_opening(
     video_path: str | Path,
     rotate_flag: int = ROTATE_FLAG,
@@ -149,8 +231,6 @@ def extract_mouth_opening(
     Each frame is rotated upright before FaceMesh so the -90 deg mounted camera
     does not break face detection.
     """
-    import mediapipe as mp
-
     cap = cv2.VideoCapture(str(video_path))
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
 
@@ -158,13 +238,8 @@ def extract_mouth_opening(
     preview_saved = save_preview is None
     frame_idx = 0
 
-    with mp.solutions.face_mesh.FaceMesh(
-        static_image_mode=False,
-        max_num_faces=1,
-        refine_landmarks=True,          # enables iris landmarks (468/473)
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5,
-    ) as fm:
+    detect, close = _make_face_landmarker()
+    try:
         while True:
             ok, frame = cap.read()
             if not ok:
@@ -174,16 +249,19 @@ def extract_mouth_opening(
                 frame = cv2.rotate(frame, rotate_flag)
             h, w = frame.shape[:2]
 
-            res = fm.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
             timestamp = frame_idx / fps
+            rgb = np.ascontiguousarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            lm = detect(rgb, int(timestamp * 1000))
 
-            if res.multi_face_landmarks:
-                lm = res.multi_face_landmarks[0].landmark
+            if lm is not None:
 
                 def px(i):
                     return np.array([lm[i].x * w, lm[i].y * h])
 
                 mouth_px = np.linalg.norm(px(LM_UPPER_LIP) - px(LM_LOWER_LIP))
+                mouth_h_px = np.linalg.norm(
+                    px(LM_MOUTH_CORNER_RIGHT) - px(LM_MOUTH_CORNER_LEFT)
+                )
 
                 # Calibrate pixels -> mm via interpupillary distance.
                 try:
@@ -195,17 +273,22 @@ def extract_mouth_opening(
                 if ipd_px > 1e-6:
                     mm_per_px = ASSUMED_IPD_MM / ipd_px
                     mouth_mm = float(mouth_px * mm_per_px)
-                    rows.append((timestamp, mouth_mm))
+                    mouth_h_mm = float(mouth_h_px * mm_per_px)
+                    rows.append((timestamp, mouth_mm, mouth_h_mm))
 
                     if not preview_saved:
                         _save_overlay(frame, px, save_preview)
                         preview_saved = True
 
             frame_idx += 1
+    finally:
+        close()
 
     cap.release()
 
-    df = pd.DataFrame(rows, columns=["timestamp", "mouth_opening_mm"])
+    df = pd.DataFrame(
+        rows, columns=["timestamp", "mouth_opening_mm", "mouth_opening_h_mm"]
+    )
     detection_rate = len(df) / frame_idx if frame_idx else 0.0
 
     if save_csv is not None and not df.empty:
@@ -374,26 +457,37 @@ def main():
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    all_dirs = [p for p in data_dir.iterdir() if p.is_dir()]
+    skipped = [p for p in all_dirs if not (p / "video.mp4").exists()]
+    for p in skipped:
+        print(f"WARNING: skipping {p.name} — no video.mp4 (incomplete upload?)",
+              flush=True)
+
+    # Chronological order (upload time), NOT alphabetical UUID order.
+    # Rows are keyed by the exercise id (= folder name = server's exerciseId),
+    # so features can be joined back to experiments in the database.
     session_dirs = sorted(
-        p for p in data_dir.iterdir()
-        if p.is_dir() and (p / "video.mp4").exists()
+        (p for p in all_dirs if (p / "video.mp4").exists()),
+        key=lambda p: p.stat().st_mtime,
     )
-    labels = [f"session_{i + 1}" for i in range(len(session_dirs))]
 
     rows = {}
-    for label, sd in zip(labels, session_dirs):
-        print(f"[{label}] {sd.name} ...", flush=True)
-        feats = extract_features(sd, out_dir=out_dir, label=label)
-        rows[label] = feats
+    for i, sd in enumerate(session_dirs):
+        exercise_id = sd.name
+        print(f"[session_{i + 1}] {exercise_id} ...", flush=True)
+        feats = extract_features(sd, out_dir=out_dir, label=exercise_id)
+        feats["session"] = i + 1  # chronological ordinal, kept for readability
+        rows[exercise_id] = feats
         print(f"    detection_rate={feats.get('video_detection_rate', 0):.2%} "
               f"steps={feats['step_count']} cadence={feats['cadence']:.1f}",
               flush=True)
 
     df = pd.DataFrame(rows).T
-    df.index.name = "session"
+    df.index.name = "exercise_id"
 
     # keep the 14 clinical features in a stable order for the table
     feature_order = [
+        "session",
         "step_count", "cadence", "gait_regularity", "activity_ratio",
         "mean_loudness", "vocal_activity_ratio", "loudness_variability",
         "loudness_trend", "mean_rotation", "rotation_variability",
@@ -404,7 +498,12 @@ def main():
     table.to_csv(out_dir / "feature_table.csv")
     df.to_csv(out_dir / "feature_table_full.csv")  # incl. detection_rate
 
-    plot_summary(table, out_dir / "feature_summary.png")
+    # Short readable labels for the plot; the CSVs keep full exercise ids.
+    plot_table = table.drop(columns=["session"]).copy()
+    plot_table.index = [
+        f"s{int(table.loc[e, 'session'])}:{str(e)[:8]}" for e in table.index
+    ]
+    plot_summary(plot_table, out_dir / "feature_summary.png")
 
     print("\n=== feature_table (features x sessions) ===")
     print(table.T.round(3).to_string())

@@ -9,6 +9,7 @@ const db = require('./db');
 const { generateData } = require('./stub-data');
 const { createPiAgent, PiAgentError } = require('./pi-agent');
 const { processRawRecording } = require('./processing');
+const pipelineRunner = require('./pipeline-runner');
 
 const SPEC_PATH = path.join(__dirname, '..', 'openapi.yaml');
 const PUBLIC_DIR = path.join(__dirname, '..', 'public');
@@ -71,8 +72,16 @@ function buildApp(pool, options = {}) {
     // Optional bearer token the Pi must present on the raw-ingestion route.
     ingestToken = process.env.INGEST_TOKEN || null,
     // Where raw uploaded files are stored (attach a Railway Volume here).
-    dataDir = process.env.DATA_DIR || path.join(__dirname, '..', 'data'),
+    dataDir: dataDirOption = process.env.DATA_DIR || path.join(__dirname, '..', 'data'),
+    // Python feature pipeline (pipeline/extract_exercise.py). Runs in the
+    // background after each raw upload; disable with PIPELINE_ENABLED=false.
+    pipelineEnabled = process.env.PIPELINE_ENABLED !== 'false',
+    pythonBin = process.env.PIPELINE_PYTHON || 'python3',
   } = options;
+
+  // Child processes (feature pipeline) run with a different cwd, so a
+  // relative DATA_DIR like "./data" must be made absolute here.
+  const dataDir = path.resolve(dataDirOption);
 
   const pi = piAgentUrl
     ? createPiAgent({ baseUrl: piAgentUrl, startTimeoutMs: piStartTimeoutMs, stopTimeoutMs: piStopTimeoutMs })
@@ -311,6 +320,28 @@ function buildApp(pool, options = {}) {
 
     const updated = await db.saveRawRecording(pool, exercise.id, { raw, data, startedAt, endedAt });
     res.status(201).json({ ok: true, exercise: updated });
+
+    // Background: run the real feature pipeline and replace the placeholder
+    // signals once it finishes (never blocks the Pi's upload response).
+    if (pipelineEnabled) {
+      pipelineRunner.processExercise(pool, exercise.id, rawDirOf(exercise.id), { pythonBin });
+    }
+  }));
+
+  // Re-run the feature pipeline on an exercise's stored raw files (additive).
+  // Useful for recordings made before the pipeline existed, or after a
+  // pipeline failure/upgrade. Returns 202; processing happens in background.
+  app.post('/exercises/:exerciseId/data/reprocess', wrap(async (req, res) => {
+    const exercise = await db.getExercise(pool, req.params.exerciseId);
+    if (!exercise) return res.status(404).json({ error: 'Exercise not found' });
+    if (!exercise.hasRawData) {
+      return res.status(409).json({ error: 'Exercise has no raw files to process.' });
+    }
+    if (!pipelineEnabled) {
+      return res.status(409).json({ error: 'Feature pipeline is disabled (PIPELINE_ENABLED=false).' });
+    }
+    pipelineRunner.processExercise(pool, exercise.id, rawDirOf(exercise.id), { pythonBin });
+    res.status(202).json({ ok: true, status: 'processing' });
   }));
 
   // Raw manifest + file download (additive, for the admin UI / researchers).

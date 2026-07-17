@@ -69,10 +69,27 @@ value of `INGEST_TOKEN`, `UPLOAD_PATH_TEMPLATE` = `/exercises/{exerciseId}/data/
 Without `PI_AGENT_URL` the server behaves as before: stub data is generated on
 stop (useful for development without hardware).
 
-**Signal processing status:** `src/processing.js` currently contains
-spec-shaped placeholders. The MediaPipe mouth-opening pipeline exists (on a
-Mac) and should be ported into `processVideo()`; sound-pressure and gait
-processors are not built yet by anyone. Each processor is an isolated function.
+**Signal processing:** after each raw upload the server spawns the Python
+feature pipeline (`pipeline/extract_exercise.py`, background, never blocks the
+Pi). On success it replaces the placeholder mouth-opening and sound-pressure
+signals with real ones (MediaPipe FaceMesh in mm; audio RMS in dBFS), stores
+the 14 clinical features (shown in the admin UI as "Clinical features"), and
+marks each chart `real` or `placeholder`. Foot speed / step lengths remain
+placeholders until a gait processor exists. If Python or its dependencies are
+missing the server logs a warning and keeps the placeholder data.
+
+Pipeline requirements (same machine as the server):
+
+```bash
+pip install mediapipe librosa soundfile scipy pandas matplotlib opencv-python
+```
+
+Related env vars: `PIPELINE_ENABLED=false` disables it, `PIPELINE_PYTHON`
+selects the interpreter (default `python3`). The batch analysis across all
+exercises is still available: `cd pipeline && python feature_pipeline.py
+--data-dir ../data --out-dir ./outputs` — its `feature_table.csv` is indexed
+by `exercise_id` (chronological `session` column included) so rows join back
+to the database.
 
 ## Deploy on Railway
 

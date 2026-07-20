@@ -10,10 +10,13 @@ Turns four raw streams per recording session into a session x 14 feature table:
     video.mp4          -> mean_mouth_opening, mouth_opening_rate,
                           opening_variability, opening_trend
 
-IMPORTANT — the phone/webcam was mounted rotated by -90 deg, so every video frame
-is stored on its side. Faces are undetectable in the raw frames. The video stage
-rotates each frame back upright (90 deg counter-clockwise) BEFORE running MediaPipe
-FaceMesh. This was verified empirically: only the CCW orientation yields a face.
+Camera orientation: the camera is mounted correctly, so frames are already
+upright and NO rotation is applied before MediaPipe. This was verified
+empirically across every recording: at 0 deg the face is detected in ~100% of
+sampled frames, versus <=17% at any rotated orientation. (An earlier version
+rotated frames 90 deg counter-clockwise on the assumption the camera was mounted
+-90 deg; that assumption was wrong and crippled detection.) If a future rig is
+mounted sideways, set ROTATE_FLAG below to the appropriate cv2.ROTATE_* value.
 
 Run:
     python feature_pipeline.py --data-dir /path/to/data --out-dir ./outputs
@@ -35,9 +38,10 @@ from scipy.signal import find_peaks
 # Configuration
 # ---------------------------------------------------------------------------
 
-# Camera rotation correction. The recording was shot with the camera turned -90 deg,
-# so we rotate each frame +90 deg (counter-clockwise) to bring the face upright.
-ROTATE_FLAG = cv2.ROTATE_90_COUNTERCLOCKWISE
+# Camera rotation correction. The camera is mounted upright, so no rotation is
+# applied (None). Set to a cv2.ROTATE_* constant only if a rig is mounted rotated.
+# Verified empirically: 0 deg detects a face in ~100% of frames; any rotation <=17%.
+ROTATE_FLAG = None
 
 # MediaPipe FaceMesh landmark indices
 LM_UPPER_LIP = 13

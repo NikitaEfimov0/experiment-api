@@ -63,14 +63,27 @@ function mergeIntoData(data, result) {
     merged.aggregates.averages.soundPressure = round(avg(result.soundPressure.values), 2);
     merged.aggregates.medians.soundPressure = round(median(result.soundPressure.values), 2);
   }
-  // footSpeed / stepLengths: no real gait-speed processor yet — keep as is.
+  // Gait from the accelerometer: foot-speed time series + per-step lengths
+  // (single-IMU estimates — see pipeline/extract_exercise.py gait_series()).
+  const gait = result.gait || {};
+  const footReal = !!(gait.footSpeed && gait.footSpeed.values.length);
+  if (footReal) {
+    merged.footSpeed = gait.footSpeed; // cm/s
+    merged.aggregates.averages.footSpeed = round(avg(gait.footSpeed.values), 2);
+    merged.aggregates.medians.footSpeed = round(median(gait.footSpeed.values), 2);
+  }
+  if (gait.stepLengths && gait.stepLengths.values.length) {
+    merged.aggregates.stepLengths = gait.stepLengths; // cm
+    merged.aggregates.averages.stepLength = round(avg(gait.stepLengths.values), 2);
+    merged.aggregates.medians.stepLength = round(median(gait.stepLengths.values), 2);
+  }
 
   // Additive extension: the 14 clinical features + which signals are real.
   merged.features = result.features || {};
   merged.processedSignals = {
     mouthOpening: !!(result.mouthOpening && result.mouthOpening.values.length),
     soundPressure: !!(result.soundPressure && result.soundPressure.values.length),
-    footSpeed: false,
+    footSpeed: footReal,
   };
   return merged;
 }

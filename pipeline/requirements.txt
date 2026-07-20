@@ -1,3 +1,7 @@
+# numba (pulled in by librosa) does not support NumPy >= 2.2. Without this cap
+# a fresh install grabs the newest NumPy and the pipeline fails at import with
+# "Numba needs NumPy 2.1 or less." Keep this until numba supports newer NumPy.
+numpy<2.2
 mediapipe
 librosa
 soundfile
